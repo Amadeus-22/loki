@@ -65,9 +65,15 @@ func getLogsCalculationSteps(sortSchema []string) []logsIndexCalculation {
 	}
 }
 
-// ErrTenantMismatch is returned when a data object holds a section of a
-// tenant other than the [Calculator]'s tenant.
-var ErrTenantMismatch = fmt.Errorf("%w: section belongs to another tenant", ErrUnprocessableObject)
+var (
+	// ErrTenantMismatch is returned when a data object holds a section of a
+	// tenant other than the [Calculator]'s tenant.
+	ErrTenantMismatch = fmt.Errorf("%w: section belongs to another tenant", ErrUnprocessableObject)
+
+	// ErrStreamsSectionCount is returned when a data object doesn't hold exactly
+	// one streams section.
+	ErrStreamsSectionCount = fmt.Errorf("%w: data object must hold one streams section", ErrUnprocessableObject)
+)
 
 // Calculator is used to calculate the indexes for a logs object and write them to the builder.
 // It reads data from the logs object in order to build bloom filters and per-section stream metadata.
@@ -119,106 +125,73 @@ func (c *Calculator) Flush() (*dataobj.Object, io.Closer, dataobj.TimeRange, err
 	return obj, closer, timeRange, nil
 }
 
-func (c *Calculator) IsFull() bool {
-	return c.indexobjBuilder.IsFull()
-}
-
 // Calculate reads the log data from the input logs object and appends the resulting indexes to calculator's builder.
 // Calculate can index several objects into one index before [Calculator.Flush].
 //
-// Every section of the object must belong to the calculator's tenant.
-// Otherwise Calculate returns [ErrTenantMismatch] and does not change the
+// Every section of the object must belong to the calculator's tenant, and the
+// object must hold exactly one streams section. Otherwise Calculate returns
+// [ErrTenantMismatch] or [ErrStreamsSectionCount] and does not change the
 // builder. On any other error the builder holds part of the object, so the
 // caller must reset or discard the calculator.
 //
 // Calculate is not thread-safe.
 func (c *Calculator) Calculate(ctx context.Context, logger log.Logger, reader *dataobj.Object, objectPath string) error {
-	if err := c.validateTenant(reader); err != nil {
+	streamsSection, err := c.validate(reader)
+	if err != nil {
 		return fmt.Errorf("path=%s: %w", objectPath, err)
 	}
 
-	g, streamsCtx := errgroup.WithContext(ctx)
-	g.SetLimit(runtime.GOMAXPROCS(0))
-	streamIDLookupByTenant := sync.Map{}
-	streamLabelsByTenant := sync.Map{}
-	shardBucketsByTenant := sync.Map{}
-
-	// Streams Section: process these first to ensure all streams have been added to the builder and are given new IDs.
-	for i, section := range reader.Sections().Filter(streams.CheckSection) {
-		g.Go(func() error {
-			streamIDLookup := make(map[int64]int64)
-			streamLabels, shardBuckets, err := c.processStreamsSection(streamsCtx, section, streamIDLookup)
-			if err != nil {
-				return fmt.Errorf("failed to process stream section path=%s section=%d: %w", objectPath, i, err)
-			}
-			// This is safe as each data object has just one streams section per tenant, which means different sections cannot overwrite the results of each other.
-			_, exists := streamIDLookupByTenant.LoadOrStore(section.Tenant, streamIDLookup)
-			if exists {
-				panic("multiple streams sections for the same tenant within one data object")
-			}
-
-			_, labelsExist := streamLabelsByTenant.LoadOrStore(section.Tenant, streamLabels)
-			if labelsExist {
-				panic("multiple streams sections for the same tenant within one data object")
-			}
-			_, shardBucketsExist := shardBucketsByTenant.LoadOrStore(section.Tenant, shardBuckets)
-			if shardBucketsExist {
-				panic("multiple streams sections for the same tenant within one data object")
-			}
-			return nil
-		})
-	}
-
-	// Wait for the streams sections to be done.
-	if err := g.Wait(); err != nil {
-		return err
+	// Process the streams section first, so that every stream has its new ID
+	// in the builder before the logs sections refer to it.
+	streamIDLookup := make(map[int64]int64)
+	streamLabels, shardBuckets, err := c.processStreamsSection(ctx, streamsSection, streamIDLookup)
+	if err != nil {
+		return fmt.Errorf("failed to process stream section path=%s: %w", objectPath, err)
 	}
 
 	g, logsCtx := errgroup.WithContext(ctx)
 	g.SetLimit(runtime.GOMAXPROCS(0))
-	// Logs Section: these can be processed in parallel once we have the stream IDs for the tenant.
-	// TODO(benclive): Start processing logs sections as soon as the stream sections are done, tenant by tenant. That way we don't need to wait for the biggest stream sections before processing the logs.
 	for i, section := range reader.Sections().Filter(logs.CheckSection) {
 		g.Go(func() error {
 			sectionLogger := log.With(logger, "section", i)
-			streamIDLookup, ok := streamIDLookupByTenant.Load(section.Tenant)
-			if !ok {
-				return fmt.Errorf("stream ID lookup not found for tenant %s", section.Tenant)
-			}
-			streamLabelsVal, ok := streamLabelsByTenant.Load(section.Tenant)
-			if !ok {
-				return fmt.Errorf("stream labels not found for tenant %s", section.Tenant)
-			}
-			shardBuckets, ok := shardBucketsByTenant.Load(section.Tenant)
-			if !ok {
-				return fmt.Errorf("shard buckets not found for tenant %s", section.Tenant)
-			}
 			// 1. A bloom filter for each column in the logs section.
 			// 2. A per-section stream time-range index using min/max of each stream in the logs section. StreamIDs will reference the aggregate stream section.
-			if err := c.processLogsSection(logsCtx, sectionLogger, objectPath, section, int64(i), streamIDLookup.(map[int64]int64), streamLabelsVal.(map[int64]labels.Labels), shardBuckets.(map[int64]uint32)); err != nil {
+			if err := c.processLogsSection(logsCtx, sectionLogger, objectPath, section, int64(i), streamIDLookup, streamLabels, shardBuckets); err != nil {
 				return fmt.Errorf("failed to process logs section path=%s section=%d: %w", objectPath, i, err)
 			}
 			return nil
 		})
 	}
-
-	// Wait for the logs sections to be done.
-	if err := g.Wait(); err != nil {
-		return err
-	}
-	return nil
+	return g.Wait()
 }
 
-// validateTenant checks that every section of reader belongs to the
-// calculator's tenant.
-func (c *Calculator) validateTenant(reader *dataobj.Object) error {
-	tenant := c.indexobjBuilder.Tenant()
+// validate checks that every section of reader belongs to the calculator's
+// tenant, and that reader holds exactly one streams section. It returns that
+// streams section.
+func (c *Calculator) validate(reader *dataobj.Object) (*dataobj.Section, error) {
+	var (
+		tenant         = c.indexobjBuilder.Tenant()
+		streamsSection *dataobj.Section
+		streamsCount   int
+		logsCount      int
+	)
 	for i, section := range reader.Sections() {
 		if section.Tenant != tenant {
-			return fmt.Errorf("%w: section %d has tenant %q, want %q", ErrTenantMismatch, i, section.Tenant, tenant)
+			return nil, fmt.Errorf("%w: section %d has tenant %q, want %q", ErrTenantMismatch, i, section.Tenant, tenant)
+		}
+		switch {
+		case streams.CheckSection(section):
+			streamsSection = section
+			streamsCount++
+		case logs.CheckSection(section):
+			logsCount++
 		}
 	}
-	return nil
+
+	if streamsCount != 1 {
+		return nil, fmt.Errorf("%w: found %d streams sections and %d logs sections", ErrStreamsSectionCount, streamsCount, logsCount)
+	}
+	return streamsSection, nil
 }
 
 func (c *Calculator) processStreamsSection(ctx context.Context, section *dataobj.Section, streamIDLookup map[int64]int64) (map[int64]labels.Labels, map[int64]uint32, error) {
@@ -245,32 +218,24 @@ func (c *Calculator) processStreamsSection(ctx context.Context, section *dataobj
 		if n == 0 && errors.Is(err, io.EOF) {
 			break
 		}
-		err = func() error {
-			c.builderMtx.Lock()
-			defer c.builderMtx.Unlock()
-			for _, stream := range streamBuf[:n] {
-				newStreamID, err := c.indexobjBuilder.AppendStream(stream)
-				if err != nil {
-					return fmt.Errorf("failed to append to stream: %w", err)
-				}
-				streamIDLookup[stream.ID] = newStreamID
-				if _, ok := streamLabels[stream.ID]; !ok {
-					streamLabels[stream.ID] = stream.Labels
-					shardBuckets[stream.ID] = streams.ShardBucket(stream.Labels)
-				}
-				c.uncompressedSize += uint64(stream.UncompressedSize)
+		for _, stream := range streamBuf[:n] {
+			newStreamID, err := c.indexobjBuilder.AppendStream(stream)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to append to stream: %w", err)
 			}
-			return nil
-		}()
-		if err != nil {
-			return nil, nil, err
+			streamIDLookup[stream.ID] = newStreamID
+			if _, ok := streamLabels[stream.ID]; !ok {
+				streamLabels[stream.ID] = stream.Labels
+				shardBuckets[stream.ID] = streams.ShardBucket(stream.Labels)
+			}
+			c.uncompressedSize += uint64(stream.UncompressedSize)
 		}
 	}
 	return streamLabels, shardBuckets, nil
 }
 
 // processLogsSection reads information from the logs section in order to build index information in the c.indexobjBuilder.
-// The provided section index only counts logs sections across all tenants, matching the indexes yielded by Filter, not positions in reader.Sections().
+// The provided section index counts only logs sections, matching the indexes yielded by Filter, not positions in reader.Sections().
 func (c *Calculator) processLogsSection(ctx context.Context, sectionLogger log.Logger, objectPath string, section *dataobj.Section, sectionIdx int64, streamIDLookup map[int64]int64, streamLabels map[int64]labels.Labels, shardBuckets map[int64]uint32) error {
 	logsBuf := make([]logs.Record, 8192)
 
