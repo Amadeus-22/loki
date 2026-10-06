@@ -70,6 +70,7 @@ func TestFlushCommitter(t *testing.T) {
 	}{
 		{name: "should fail without retrying when the object is not single-tenant", err: index.ErrNotSingleTenant},
 		{name: "should fail without retrying when the error wraps ErrUnprocessableObject", err: fmt.Errorf("%w: test", index.ErrUnprocessableObject)},
+		{name: "should fail without retrying when a section belongs to another tenant", err: index.ErrTenantMismatch},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var (

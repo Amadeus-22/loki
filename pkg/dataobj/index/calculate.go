@@ -44,7 +44,6 @@ type logsIndexCalculation interface {
 }
 
 type logsCalculationContext struct {
-	tenantID       string
 	objectPath     string
 	sectionIdx     int64
 	streamIDLookup map[int64]int64
@@ -66,53 +65,58 @@ func getLogsCalculationSteps(sortSchema []string) []logsIndexCalculation {
 	}
 }
 
+// ErrTenantMismatch is returned when a data object holds a section of a
+// tenant other than the [Calculator]'s tenant.
+var ErrTenantMismatch = fmt.Errorf("%w: section belongs to another tenant", ErrUnprocessableObject)
+
 // Calculator is used to calculate the indexes for a logs object and write them to the builder.
 // It reads data from the logs object in order to build bloom filters and per-section stream metadata.
+// Calculator is bound to a single tenant.
 type Calculator struct {
-	indexobjBuilder      *indexobj.Builder
-	builderMtx           sync.Mutex
-	metrics              *CalculatorMetrics
-	uncompressedByTenant map[string]uint64
+	indexobjBuilder  *indexobj.Builder
+	builderMtx       sync.Mutex
+	metrics          *CalculatorMetrics
+	uncompressedSize uint64
 }
 
-// NewCalculator returns a [Calculator].
+// NewCalculator returns a [Calculator] for the tenant of indexobjBuilder.
 func NewCalculator(indexobjBuilder *indexobj.Builder, metrics *CalculatorMetrics) *Calculator {
 	return &Calculator{
-		indexobjBuilder:      indexobjBuilder,
-		metrics:              metrics,
-		uncompressedByTenant: make(map[string]uint64),
+		indexobjBuilder: indexobjBuilder,
+		metrics:         metrics,
 	}
 }
 
 func (c *Calculator) Reset() {
 	c.indexobjBuilder.Reset()
-	clear(c.uncompressedByTenant)
+	c.uncompressedSize = 0
 }
 
-func (c *Calculator) TimeRanges() []dataobj.TimeRange {
-	ranges := c.indexobjBuilder.TimeRanges()
-	for i := range ranges {
-		ranges[i].UncompressedLogsSize = c.uncompressedByTenant[ranges[i].Tenant]
-	}
-	return ranges
+// TimeRange returns the tenant, time range and uncompressed logs size of the
+// data calculated since the last [Calculator.Flush] or [Calculator.Reset].
+// MinTime and MaxTime are zero when no data was calculated.
+func (c *Calculator) TimeRange() dataobj.TimeRange {
+	timeRange := c.indexobjBuilder.TimeRange()
+	timeRange.UncompressedLogsSize = c.uncompressedSize
+	return timeRange
 }
 
 // Flush consumes the calculator's state and returns the built object together
-// with the time ranges captured for it. The uncompressed-size accumulator is
+// with the time range captured for it. The uncompressed-size accumulator is
 // tied to the underlying builder's lifecycle: [indexobj.Builder.Flush] resets
 // the builder, so we clear the accumulator in the same step to keep the two in
 // sync. Otherwise a failed upload or ToC write followed by a Kafka retry would
 // add the reprocessed bytes on top of the stale count.
-func (c *Calculator) Flush() (*dataobj.Object, io.Closer, []dataobj.TimeRange, error) {
-	ranges := c.TimeRanges()
+func (c *Calculator) Flush() (*dataobj.Object, io.Closer, dataobj.TimeRange, error) {
+	timeRange := c.TimeRange()
 
 	obj, closer, err := c.indexobjBuilder.Flush()
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, dataobj.TimeRange{}, err
 	}
 
-	clear(c.uncompressedByTenant)
-	return obj, closer, ranges, nil
+	c.uncompressedSize = 0
+	return obj, closer, timeRange, nil
 }
 
 func (c *Calculator) IsFull() bool {
@@ -120,8 +124,19 @@ func (c *Calculator) IsFull() bool {
 }
 
 // Calculate reads the log data from the input logs object and appends the resulting indexes to calculator's builder.
+// Calculate can index several objects into one index before [Calculator.Flush].
+//
+// Every section of the object must belong to the calculator's tenant.
+// Otherwise Calculate returns [ErrTenantMismatch] and does not change the
+// builder. On any other error the builder holds part of the object, so the
+// caller must reset or discard the calculator.
+//
 // Calculate is not thread-safe.
 func (c *Calculator) Calculate(ctx context.Context, logger log.Logger, reader *dataobj.Object, objectPath string) error {
+	if err := c.validateTenant(reader); err != nil {
+		return fmt.Errorf("path=%s: %w", objectPath, err)
+	}
+
 	g, streamsCtx := errgroup.WithContext(ctx)
 	g.SetLimit(runtime.GOMAXPROCS(0))
 	streamIDLookupByTenant := sync.Map{}
@@ -194,6 +209,18 @@ func (c *Calculator) Calculate(ctx context.Context, logger log.Logger, reader *d
 	return nil
 }
 
+// validateTenant checks that every section of reader belongs to the
+// calculator's tenant.
+func (c *Calculator) validateTenant(reader *dataobj.Object) error {
+	tenant := c.indexobjBuilder.Tenant()
+	for i, section := range reader.Sections() {
+		if section.Tenant != tenant {
+			return fmt.Errorf("%w: section %d has tenant %q, want %q", ErrTenantMismatch, i, section.Tenant, tenant)
+		}
+	}
+	return nil
+}
+
 func (c *Calculator) processStreamsSection(ctx context.Context, section *dataobj.Section, streamIDLookup map[int64]int64) (map[int64]labels.Labels, map[int64]uint32, error) {
 	streamSection, err := streams.Open(ctx, section)
 	if err != nil {
@@ -222,7 +249,7 @@ func (c *Calculator) processStreamsSection(ctx context.Context, section *dataobj
 			c.builderMtx.Lock()
 			defer c.builderMtx.Unlock()
 			for _, stream := range streamBuf[:n] {
-				newStreamID, err := c.indexobjBuilder.AppendStream(section.Tenant, stream)
+				newStreamID, err := c.indexobjBuilder.AppendStream(stream)
 				if err != nil {
 					return fmt.Errorf("failed to append to stream: %w", err)
 				}
@@ -231,7 +258,7 @@ func (c *Calculator) processStreamsSection(ctx context.Context, section *dataobj
 					streamLabels[stream.ID] = stream.Labels
 					shardBuckets[stream.ID] = streams.ShardBucket(stream.Labels)
 				}
-				c.uncompressedByTenant[section.Tenant] += uint64(stream.UncompressedSize)
+				c.uncompressedSize += uint64(stream.UncompressedSize)
 			}
 			return nil
 		}()
@@ -257,8 +284,6 @@ func (c *Calculator) processLogsSection(ctx context.Context, sectionLogger log.L
 		return fmt.Errorf("failed to read logs section schema labels: %w", err)
 	}
 
-	tenantID := section.Tenant
-
 	// Fetch the column statistics in order to init the bloom filters for each column
 	stats, err := logs.ReadStats(ctx, logsSection)
 	if err != nil {
@@ -266,7 +291,6 @@ func (c *Calculator) processLogsSection(ctx context.Context, sectionLogger log.L
 	}
 
 	calculationContext := &logsCalculationContext{
-		tenantID:           tenantID,
 		objectPath:         objectPath,
 		sectionIdx:         sectionIdx,
 		streamIDLookup:     streamIDLookup,
@@ -290,9 +314,9 @@ func (c *Calculator) processLogsSection(ctx context.Context, sectionLogger log.L
 	// Lock the builder during Prepare because some calculations (e.g.,
 	// columnValuesCalculation) mutate shared builder state via
 	// PrepareBloomColumn. The Calculate method dispatches one goroutine per
-	// logs section (see g.Go in Calculate), so two processLogsSection calls
-	// for sections of the same tenant within one data object run
-	// concurrently against the same per-tenant postings builder.
+	// logs section (see g.Go in Calculate), so processLogsSection calls for
+	// the sections of one data object run concurrently against the same
+	// postings builder.
 	c.builderMtx.Lock()
 	for _, calculation := range calculationSteps {
 		if err := calculation.Prepare(ctx, calculationContext, section, stats); err != nil {

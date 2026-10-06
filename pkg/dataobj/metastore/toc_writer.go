@@ -51,13 +51,14 @@ func checkTenant(tocObject *dataobj.Object, tenant string) error {
 // The TableOfContents (ToC) writer manages the metastore's Table of Contents files, which are a list of other data objects in storage for a particular tenant and time range.
 // The Table of Contents files are used to look up other objects based on a time range, either index files or the log objects themselves. All entries are expected to have an applicable time window.
 type TableOfContentsWriter struct {
-	tocBuilder *indexobj.Builder // New index pointer based builder.
-	metrics    *tocMetrics
-	bucket     objstore.Bucket
-	logger     log.Logger
-	buf        *bytes.Buffer
+	metrics *tocMetrics
+	bucket  objstore.Bucket
+	logger  log.Logger
 
-	builderOnce sync.Once
+	// buf and builderMetrics are set on the first WriteEntry call.
+	buf            *bytes.Buffer
+	builderMetrics *indexobj.BuilderMetrics
+	initOnce       sync.Once
 }
 
 // NewTableOfContentsWriter creates a new Writer for adding entries to the metastore's Table of Contents files.
@@ -65,10 +66,9 @@ func NewTableOfContentsWriter(bucket objstore.Bucket, logger log.Logger) *TableO
 	metrics := newTableOfContentsMetrics()
 
 	return &TableOfContentsWriter{
-		bucket:      bucket,
-		metrics:     metrics,
-		logger:      logger,
-		builderOnce: sync.Once{},
+		bucket:  bucket,
+		metrics: metrics,
+		logger:  logger,
 	}
 }
 
@@ -80,27 +80,15 @@ func (m *TableOfContentsWriter) UnregisterMetrics(reg prometheus.Registerer) {
 	m.metrics.unregister(reg)
 }
 
-func (m *TableOfContentsWriter) initBuilder() error {
-	var initErr error
-
-	m.builderOnce.Do(func() {
-		m.buf = bytes.NewBuffer(make([]byte, 0, tocBuilderCfg.TargetObjectSize))
-		indexBuilder, err := indexobj.NewBuilder(tocBuilderCfg, nil, indexobj.NewBuilderMetrics(nil))
-		if err != nil {
-			initErr = err
-			return
-		}
-		m.tocBuilder = indexBuilder
-	})
-	return initErr
-}
-
 // WriteEntry adds entry to the tenant's ToC of every window that entry
 // overlaps. It writes one window at a time and retries each window until the
 // write succeeds or ctx is done.
 //
 // WriteEntry returns an error without retrying if entry fails validation or a
 // ToC holds a section of another tenant.
+//
+// WriteEntry is not safe for concurrent use, because all calls share one
+// buffer.
 func (m *TableOfContentsWriter) WriteEntry(ctx context.Context, tenant string, entry TableOfContentsEntry) error {
 	processingTime := prometheus.NewTimer(m.metrics.tocProcessingTime)
 	defer processingTime.ObserveDuration()
@@ -109,8 +97,17 @@ func (m *TableOfContentsWriter) WriteEntry(ctx context.Context, tenant string, e
 		return err
 	}
 
-	// Initialize builder if this is the first call for this partition
-	if err := m.initBuilder(); err != nil {
+	// The buffer is large, so allocate it on the first call only.
+	m.initOnce.Do(func() {
+		m.buf = bytes.NewBuffer(make([]byte, 0, tocBuilderCfg.TargetObjectSize))
+		m.builderMetrics = indexobj.NewBuilderMetrics(nil)
+	})
+
+	// A builder is bound to one tenant, so each call creates its own. This is
+	// cheap, because the builders share their metrics and a builder creates
+	// its section builders on first use.
+	tocBuilder, err := indexobj.NewBuilder(tenant, tocBuilderCfg, nil, m.builderMetrics)
+	if err != nil {
 		return err
 	}
 
@@ -132,7 +129,7 @@ func (m *TableOfContentsWriter) WriteEntry(ctx context.Context, tenant string, e
 				}
 
 				m.buf.Reset()
-				m.tocBuilder.Reset()
+				tocBuilder.Reset()
 
 				if existing != nil {
 					_, err := io.Copy(m.buf, existing)
@@ -147,7 +144,7 @@ func (m *TableOfContentsWriter) WriteEntry(ctx context.Context, tenant string, e
 					if err != nil {
 						return nil, fmt.Errorf("creating object from buffer: %w", err)
 					}
-					err = m.copyFromExistingToc(ctx, tenant, object)
+					err = copyFromExistingToc(ctx, tocBuilder, object)
 					if err != nil {
 						return nil, fmt.Errorf("reading existing metastore version: %w", err)
 					}
@@ -155,7 +152,7 @@ func (m *TableOfContentsWriter) WriteEntry(ctx context.Context, tenant string, e
 				}
 
 				encodingDuration := prometheus.NewTimer(m.metrics.tocEncodingTime)
-				err := m.tocBuilder.AppendIndexPointer(tenant, indexpointers.IndexPointer{
+				err := tocBuilder.AppendIndexPointer(indexpointers.IndexPointer{
 					Path:    entry.Path,
 					StartTs: entry.StartTime,
 					EndTs:   entry.EndTime,
@@ -169,7 +166,7 @@ func (m *TableOfContentsWriter) WriteEntry(ctx context.Context, tenant string, e
 					closer io.Closer
 				)
 
-				obj, closer, err = m.tocBuilder.Flush()
+				obj, closer, err = tocBuilder.Flush()
 				if err != nil {
 					return nil, fmt.Errorf("flushing metastore builder: %w", err)
 				}
@@ -207,9 +204,6 @@ func (m *TableOfContentsWriter) WriteEntry(ctx context.Context, tenant string, e
 			b.Wait()
 		}
 
-		// Reset at the end too so we don't leave our memory hanging around between calls.
-		m.tocBuilder.Reset()
-
 		// The loop stops without writing on a tenant mismatch, or once the
 		// context is done. The context can be done before the first attempt,
 		// when err is still nil.
@@ -239,9 +233,9 @@ func (w *wrappedReadCloser) Close() error {
 }
 
 // copyFromExistingToc reads the provided table of contents (toc) object and appends the contained index pointers to the builder. The resulting builder will contain exactly the same entries as the input object.
-// It returns errTenantMismatch if the object holds a section of a tenant other than tenant.
-func (m *TableOfContentsWriter) copyFromExistingToc(ctx context.Context, tenant string, tocObject *dataobj.Object) error {
-	if err := checkTenant(tocObject, tenant); err != nil {
+// It returns errTenantMismatch if the object holds a section of a tenant other than the builder's tenant.
+func copyFromExistingToc(ctx context.Context, builder *indexobj.Builder, tocObject *dataobj.Object) error {
+	if err := checkTenant(tocObject, builder.Tenant()); err != nil {
 		return err
 	}
 
@@ -266,7 +260,7 @@ func (m *TableOfContentsWriter) copyFromExistingToc(ctx context.Context, tenant 
 				return fmt.Errorf("reading index pointers: %w", err)
 			}
 			for _, indexPointer := range pbuf[:n] {
-				if err := m.tocBuilder.AppendIndexPointer(tenant, indexPointer); err != nil {
+				if err := builder.AppendIndexPointer(indexPointer); err != nil {
 					return fmt.Errorf("appending index pointers: %w", err)
 				}
 			}
